@@ -9,7 +9,7 @@ output: html_document
 knitr::opts_knit$set(root.dir = 'C:/Users/l_vdp/Documents/MSc_Internship/tower_fps')
 ```
 
-This R Markdown document is the accompanying script for the Research Report: "Tree cover has a stabilizing effect on daytime carbon fluxes of a Mediterranean oak woodland" by Laura van der Poel. For details about this study, consult the report. 
+This R Markdown document is the accompanying script for the Research Report: "The effect of tree cover on daytime carbon fluxes of a Mediterranean oak woodland" by Laura van der Poel. For details about this study, consult the report. 
 
 Here, all the necessary steps for the footprint calculation based on the model by Kljun et al. (2015) are shown. These footprints are overlaid with the tree shapes, and tree cover is calculated.
 
