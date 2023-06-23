@@ -1,0 +1,430 @@
+---
+title: "FootprintAnalysis"
+author: "Laura van der Poel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = 'C:/Users/l_vdp/Documents/MSc_Internship/tower_fps')
+```
+
+This R Markdown document is the accompanying script for the Research Report: "Tree cover has a stabilizing effect on daytime carbon fluxes of a Mediterranean oak woodland" by Laura van der Poel. For details about this study, consult the report. 
+
+Here, all the necessary steps for the footprint calculation based on the model by Kljun et al. (2015) are shown. These footprints are overlaid with the tree shapes, and tree cover is calculated.
+
+```{r message=FALSE} 
+# load the libraries
+rm(list=ls())
+
+library(stringr)
+library(tidyterra)
+library(sf)
+library(tidyr)
+library(sp)
+library(beepr)
+library(lubridate) 
+library(EBImage)
+library(progress)
+library(terra)
+library(ncdf4)
+library(flux)
+library(FME)
+
+
+```
+
+#### Create dataframe for FP calculation 
+
+The data is the raw data from the central eddy covariance tower in Majadas, as preprocessed by the Max Planck Institute.
+
+```{r load-data}
+# load Flux data
+FPathF        <- "./data/Majadas_main_2015-20.csv"
+dfF_all.na    <- read.csv(FPathF, row.names=1) 
+dfF_all.na$rDate <- as_datetime(dfF_all.na$rDate)  
+
+# delete rows with NA's in necessary columns for footprint model
+dfF_all           <- dfF_all.na %>% drop_na(v_sd, rDate, umean, wind_dir, ustar, L) 
+
+```
+
+#### Get Boundary Layer Height
+
+The boundary layer height (blh) was downloaded from https://cds.climate.copernicus.eu/cdsapp#!/software/app-era5-explorer?tab=overview, in netcdf format.
+
+```{r get-blh}
+# get data
+ncpath      <- "./data/ERA5/adaptor.mars.internal-2015-2020.nc"
+nc_data     <- nc_open(ncpath)
+
+# extract blh, latitude, longitude and time data
+blh_array   <- ncvar_get(nc_data, "blh")
+lat         <- ncvar_get(nc_data, "latitude")
+lon         <- ncvar_get(nc_data, "longitude")
+time        <- ncvar_get(nc_data, "time") # unit of time is "hours since 1900-01-01 00:00:00.0"
+
+# transform hours from 1900-01-01 to date 
+time_obs    <- as.POSIXct(time*3600, origin = "1900-01-01" )
+
+# get FillValue and replace with NA
+fillvalue   <- ncatt_get(nc_data, "blh", "_FillValue")
+blh_array[blh_array==fillvalue$value] <- NA
+
+# Create 2D matrix of long, lat and time
+lonlattime  <- as.matrix(expand.grid(lon,lat,time_obs))
+
+# reshape whole blh_array
+blh_vec_long <- as.vector(blh_array)
+
+# create data.frame
+blh_obs    <- data.frame(cbind(lonlattime, blh_vec_long))
+colnames(blh_obs) <- c('lon', 'lat', 'timestamp', 'blh') 
+
+# linear interpolation to 30 minutes
+blh_obs$timestamp <- ymd_hms(blh_obs$timestamp)
+blh_li            <- lips(blh_obs$timestamp, as.numeric(blh_obs$blh), x.step = 1800)
+colnames(blh_li)  <- c('rDate', 'blh')
+
+
+# join dataframes
+dfF_all       <- left_join(dfF_all, blh_li, by='rDate')
+
+```
+
+#### Footprint preparation
+
+We filter on u-star threshold, calculated as in Papale et al. (2006) by the Max Planck Institute. 
+
+```{r filter-ustar}
+# ustar threshold
+ustar_thres <- unique(dfF_all$Ustar_uStar_Thres)[3] # 0.21
+dfF_all     <- dfF_all[dfF_all$ustar > ustar_thres, ] 
+
+```
+
+Other necessary information for the footprint function
+
+```{r settings}
+
+# settings for footprint model
+
+Fzm           <- 15   # Flux measurement height
+CHeight       <- 8    # Canopy height
+DomX          <- 500  # FP Domain settings
+DomY          <- 500  # FP Domain settings
+
+
+dfF_all$zmd   <- Fzm-(2/3)*CHeight # Measurement height above displacement height, needed in the model
+```
+
+Select begin and end date of analysis.
+
+```{r beg-end-date}
+# crop df till Beg-EndDate  
+Title         <- 'Jan_2015' # title will be later used to store results
+BegDate       <- ymd_hm("2015-01-01 00:00")    
+EndDate       <- ymd_hm("2015-02-01 00:00")     
+
+dfF   <- dfF_all[dfF_all$rDate >= BegDate & dfF_all$rDate < EndDate,
+                 # variables for FP calculation
+                   c("rDate","umean","wind_dir","ustar","L","v_sd","zmd","blh", "day_night")]
+
+```
+
+#### Optimize the roughness length per wind direction bin
+
+Calculate z0 for the selected subset of data. 
+
+```{r optimize-z0, results = FALSE, message=FALSE}
+
+# function to add column to dataframe, conatining wind direction bin 
+add_wind_dir_bins <- function(df, degrees_per_bin=30){
+  
+  # create wind direction bins of 30 degrees
+  bins <- seq(0,360,degrees_per_bin)
+  
+  # group dataframe
+  df <- df %>% mutate(wind_dir_bins = cut(wind_dir, breaks=bins))
+  
+  # give correct names
+  wind_dirs <- c('NNE','NE', 'ENE', 'ESE','SE', 'SSE', 'SSW', 'SW', 'WSW', 'WNW', 'NW',  'NNW')
+  levels(df$wind_dir_bins) <- wind_dirs
+  
+  return(df)}
+
+# this function filters the dataframe to obtain only measurements of stable conditions
+subset_for_z0_calc <- function(df){
+  df.ss <- df[(abs(Fzm / df$L)) < 0.1 & 
+                df$ustar > 0.21 &
+                df$ustar < 0.8 &
+                !is.na(df$wind_dir_bins),]
+  return(df.ss)}
+
+# formula for Uz that will be optimized
+u_fun_z0 <- function(par, ustar, umean, k=0.4, z=15, d=9.666667){
+  z0 = par
+  
+  # function for Uz
+  Uz <- (ustar / k) * log((z - d)/ z0)
+  
+  # residuals
+  res <- umean - Uz 
+  return(res)
+}
+
+# function that finds optimized z0 for specific wind direction bin
+opt_z0 <- function(wind_dir, df.ss, p = 0.8){
+  
+  df.wind_dir <- df.ss[df.ss$wind_dir_bin == wind_dir, ]
+  ustar <- df.wind_dir$ustar
+  umean <- df.wind_dir$umean
+  
+  fit <- modFit(f=u_fun_z0, p=0.8, lower=0, upper=20, ustar = ustar, 
+                umean = umean)
+  
+  summ <- summary(fit)
+  modvar <- summ$modVariance
+  
+  mcmc <- modMCMC(f=u_fun_z0, p=0.8, ustar=ustar, umean=umean, jump = c(0.05, 0.05), 
+                  lower = 0, upper = 20, prior =NULL, var0=modvar, niter=5000, outputlength = 1000)
+  
+  return(mcmc$bestpar)
+}
+
+
+# get results of optimizer function
+get_results <- function(df.ss){
+  wind_dirs <- c('NNE','NE', 'ENE', 'ESE','SE', 'SSE', 'SSW', 'SW', 'WSW', 'WNW', 'NW',  'NNW')
+  # create dataframe to store results
+  results <- data.frame(wind_dir_bins = wind_dirs, z0 = NA)
+  
+  for(wind_dir in wind_dirs){
+    
+    tryCatch({
+    bestpar <- opt_z0(wind_dir, df.ss=df.ss)
+    results[results$wind_dir_bins == wind_dir, 'z0'] <- bestpar
+    
+  }, error=function(e){})
+    
+  }
+  return(results)
+}
+
+# now apply functions to our data
+dfF          <- add_wind_dir_bins(dfF) 
+dfF.ss       <- subset_for_z0_calc(dfF)
+
+z0_wind_dirs <- get_results(dfF.ss)
+
+```
+
+#### Load spatial data
+
+Now, load the spatial data: towers, tree locations, and tree areas
+The tower coordinates are taken from the Towers.shp file, and stored in a terra-object. We will use this package for all the spatial data and calculations. 
+
+```{r}
+# store tower coordinates in correct format and crs
+TowerXY       <- matrix(c(2976558.03329999931156635,2012190.60920000076293945), ncol=2) 
+TowerXY       <- vect(TowerXY, type="points", crs="EPSG:3035")
+TowerXY       <- project(TowerXY, 'EPSG:32629')
+
+```
+
+Load the tree data, both locations of trees as areas
+
+```{r}
+# area trees
+treeArea.path  <- "./data/copas_cir_maj_2019/copas_cir_maj_2019.shp"
+treeArea       <- vect(treeArea.path)
+
+# location trees
+treeLoca.path  <- "./data/Trees_Majadas/Trees_Majadas.shp"
+treeLoca       <- vect(treeLoca.path) # crs = 'EPSG:3035'
+treeLoca_p     <- project(treeLoca,  'EPSG:32629')
+```
+
+
+### Create functions to overlay footprints with trees
+
+These functions are used in analysing FPOut, the result of the footprint model.
+
+This function takes the values of the footprint distribution [m-2], and shifts them to the tower location in a SpatRaster
+```{r get-fp-distr}
+get_fp_distr <- function(FPOut, DomX, DomY, TowerXY){
+    
+    
+    fp_values                <- FPOut$fclim_2d
+    fp_values[fp_values < 0] <- 0
+    fp_values                <- fp_values / sum(fp_values)
+
+    # fp values as SpatRaster, and shift to location of tower
+    fp_rast      <- raster::raster(t(fp_values[,ncol(fp_values):1]),
+                                    xmn = -DomX,
+                                    xmx = DomX,
+                                    ymn = -DomY,
+                                    ymx = DomY,
+                                    crs = 32629) %>% rast()
+
+    fp_rast_sh    <- shift(fp_rast, dx=crds(TowerXY)[1], dy=crds(TowerXY)[2])
+    
+    return(fp_rast_sh)
+    }
+```
+
+
+This function gets the first (80%) contour line of the footprint, and stores it in a SpatVector.
+
+```{r get-fp-cont}
+get_fp_cont <- function(FPOut, TowerXY){
+  
+  # store xr & yr (the x and y array from the contour lines) as a SpatVector
+  contour_vect <- cbind(FPOut$xr[[1]], as.array(FPOut$yr)[[1]]) %>% 
+    vect() %>% as.lines()
+  
+  # shift to tower location
+  contour_vect_sh <- shift(contour_vect, dx=crds(TowerXY)[1], dy=crds(TowerXY)[2])
+  crs(contour_vect_sh) <- 'EPSG:32629'
+  return(contour_vect_sh)
+}
+```
+
+This function calculates the tree density and the tree canopy fraction in the footprint contour.
+
+```{r calc-trees-fp}
+calc_trees_fp <- function(contour_vect_sh, treeArea.path,
+                          treeLoca_p){
+  # crop data to contour 
+  
+  contour_poly       <- as.polygons(contour_vect_sh)
+  treeArea_c         <- vect(treeArea.path, filter= as.polygons(ext(contour_vect_sh))) # crs = 'EPSG:32629'
+  treeLoca_c         <- crop(treeLoca_p, ext(contour_vect_sh))
+  
+  # store area in footprint contour
+  
+  FPArea      <- expanse(contour_poly, unit='m')
+  
+  # 1: count number of trees in contour
+  
+  n_trs         <- terra::extract(contour_poly, treeLoca_c) %>% data.frame()
+  TreeCount     <- sum(n_trs$id.x, na.rm=TRUE)   # number of trees in footprint
+  TreeDens      <- (TreeCount  / FPArea) * 10000    # density of trees: number of trees per hectare
+  
+  #2: sum area of trees in contour
+  
+  a             <- terra::intersect(contour_poly, treeArea_c)
+  TreeArea      <- sum(expanse(a, unit='m'))  # area of trees in footprint
+  TreeArea_frac <- TreeArea / FPArea   # fraction of area of trees in footprint
+  
+  return(list=c(FPArea=FPArea, TreeCount=TreeCount, TreeDens=TreeDens, 
+                TreeArea=TreeArea, TreeArea_frac=TreeArea_frac))
+
+}
+```
+
+Initialize progress par from {progress} package
+
+```{r}
+n_iter = nrow(dfF) * 2
+pb <- progress_bar$new(format = "(:spin) [:bar] :percent [Elapsed time: :elapsedfull || Estimated time remaining: :eta]",
+                       total = n_iter,
+                       complete = "=",   # Completion bar character
+                       incomplete = "-", # Incomplete bar character
+                       current = ">",    # Current bar character
+                       clear = FALSE,    # If TRUE, clears the bar when finish
+                       width = 100)      # Width of the progress bar
+```
+
+#### Footprint model 
+
+Finally, get the footprint model itself 
+
+```{r fp-preparation}
+# load the function 
+source("./scripts/functions_kljun/calc_footprint_FFP_climatology.R")
+
+# path to store footprint
+SPath         <- "./footprints/"
+
+```
+
+#### Loop over entire dataframe
+
+Loop over the dataframe, to calculate the footprint and the tree cover and density for every observation. An extra loop is built in to try both z0=NA, and z0=the optimised z0 per wind direction bin. 
+
+
+```{r for-loop, results = FALSE, message=FALSE}
+
+StartTime     <- Sys.time()
+
+for (i in 1:nrow(dfF)){
+  
+  # loop over z0-types, Kljun 2015 and Pennypacker Baldocchi 2015
+  for(z0_type in c('K15', 'PB15')){
+    if(z0_type == 'K15'){z0 = NA}
+    if(z0_type == 'PB15'){z0 = z0_wind_dirs[z0_wind_dirs$wind_dir_bins == 
+                                              dfF[i, 'wind_dir_bins'], 'z0']}
+  tryCatch({
+    print(paste0(i, '/', nrow(dfF)))
+    # progress bar, updates the current state
+    pb$tick()
+    
+    #### run FP ####
+    FPOut       <- calc_footprint_FFP_climatology(zm        = dfF$zmd[i],
+                                                  z0        = z0,
+                                                  umean     = dfF$umean[i],
+                                                  h         = dfF$blh[i],
+                                                  ol        = dfF$L[i],
+                                                  sigmav    = dfF$v_sd[i],
+                                                  ustar     = dfF$ustar[i],
+                                                  wind_dir  = dfF$wind_dir[i],
+                                                  domain    = c(-DomX,DomX,-DomY,DomY),
+                                                  dx = 1,dy = 1,
+                                                  r         = 0.8,
+                                                  crop      = 0,
+                                                  rslayer   = 1 
+                                                  # fig = 1 (can be added to produce figure)
+                                                  )
+    FPTimeStamp  <- paste0(year(dfF$rDate[i]),
+                          str_pad(string = month(dfF$rDate[i]),width = 2,side = 'left',pad = '0'),
+                          str_pad(string = mday(dfF$rDate[i]),width = 2,side = 'left',pad = '0'),
+                          str_pad(string = hour(dfF$rDate[i]),width = 2,side = 'left',pad = '0'),
+                          str_pad(string = minute(dfF$rDate[i]),width = 2,side = 'left',pad = '0'))
+    
+    # fp values in a raster, shifted to tower location 
+    fp_rast_sh <- get_fp_distr(FPOut=FPOut, DomX=DomX, DomY=DomY, TowerXY=TowerXY)
+    
+    # footprint contourline (80%) as SpatVector, and shift to location of tower
+    contour_vect_sh <- get_fp_cont(FPOut=FPOut, TowerXY = TowerXY)
+
+    # calculate trees in footprint 
+    tree_values <- calc_trees_fp(contour_vect_sh=contour_vect_sh, 
+                              treeArea.path=treeArea.path, treeLoca_p=treeLoca_p)
+    
+    # save in dataframe with added title for the roughness length that was used
+    names(tree_values) <- lapply(names(tree_values), function(x) paste0(x, '_',z0_type))
+    
+    dfF[i, names(tree_values)] <- tree_values
+  
+    }, warning = function (war) {
+    print(paste0("Footprint ", i, " did not work well, because ", warning))
+  }, error = function (err) {
+    print(paste0("Footprint ", i, " did not work, because ", err))
+  })
+  }
+}
+
+EndTime <- Sys.time()
+print(EndTime-StartTime)
+```
+ 
+And store results in a .csv file
+
+
+```{r}
+write.csv(dfF, paste0(SPath, Title ,  '_FPdata_trees.csv'))
+
+```
+
+In the research, also the footprints and the contour lines were stored and analysed. This part was left out of the current script, but can be requested if needed.
